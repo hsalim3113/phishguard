@@ -2,8 +2,8 @@ from pathlib import Path
 from joblib import load
 import numpy as np
 
-MODEL_PATH = Path("models/model_logreg.joblib")
-VEC_PATH = Path("models/tfidf_vectorizer.joblib")
+MODEL_PATH = Path("model_logreg.joblib")
+VEC_PATH = Path("tfidf_vectorizer.joblib")
 
 def load_assets():
     model = load(MODEL_PATH)
@@ -18,3 +18,4 @@ def predict_email(model, vec, subject: str, body: str):
     conf = float(np.max(proba))
     label = "phishing" if pred_idx == 1 else "legitimate"
     return label, conf, text
+
