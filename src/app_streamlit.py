@@ -42,6 +42,13 @@ if "lm_result_revealed" not in st.session_state:
     st.session_state.lm_result_revealed = False
 if "lm_last_correct" not in st.session_state:
     st.session_state.lm_last_correct = None
+# These two drive the value= parameter on the input widgets below.
+# We use value= instead of key= so we can safely overwrite them from
+# button handlers without hitting Streamlit's widget-bound key restriction
+if "subject_default" not in st.session_state:
+    st.session_state.subject_default = ""
+if "body_default" not in st.session_state:
+    st.session_state.body_default = ""
 
 st.set_page_config(page_title="PhishGuard: AI-Powered Phishing Email Detector", layout="centered")
 
@@ -145,19 +152,20 @@ EXAMPLE_BODY = (
 )
 
 if st.button("Load a Phishing Email Example"):
-    # Setting these before st.rerun() means the values are already in session
-    # state when the text_input and text_area widgets render on the next run
-    st.session_state.subject_input = EXAMPLE_SUBJECT
-    st.session_state.body_input = EXAMPLE_BODY
+    # Write to the _default keys (not widget-bound keys) so Streamlit doesn't
+    # raise a StreamlitAPIException when the widgets render after the rerun
+    st.session_state.subject_default = EXAMPLE_SUBJECT
+    st.session_state.body_default = EXAMPLE_BODY
     # Clear any previous result so loading a new example doesn't show a stale verdict
     st.session_state.lm_result_revealed = False
     st.session_state.lm_last_correct = None
     st.rerun()
 
-# The key= argument ties each widget's value to session state, which lets us
-# pre-fill or clear the fields programmatically from button handlers elsewhere
-subject = st.text_input("Email subject", "", key="subject_input")
-body = st.text_area("Email body", "", height=220, key="body_input")
+# value= pulls from the _default session state variables so both the example
+# loader and the Try Another Email button can pre-fill or clear the fields
+# without touching a widget-bound key (which Streamlit disallows)
+subject = st.text_input("Email subject", value=st.session_state.subject_default)
+body = st.text_area("Email body", value=st.session_state.body_default, height=220)
 
 learning_mode = st.checkbox("Learning mode (guess first)")
 
@@ -289,12 +297,15 @@ if learning_mode:
         )
 
         # Reset button — clears the fields and hides the result so the user
-        # can try another email without having to refresh the whole page
+        # can try another email without having to refresh the whole page.
+        # We clear the _default keys (not widget-bound keys) to avoid the
+        # StreamlitAPIException that fires when you write to a key that's
+        # already bound to a rendered widget in the same run
         if st.button("Try Another Email"):
             st.session_state.lm_result_revealed = False
             st.session_state.lm_last_correct = None
-            st.session_state.subject_input = ""
-            st.session_state.body_input = ""
+            st.session_state.subject_default = ""
+            st.session_state.body_default = ""
             st.rerun()
 
         st.caption("Only metadata is logged locally (no email content stored).")
