@@ -1,0 +1,21 @@
+===== PhishGuard Model Evaluation Report =====
+
+Accuracy  : 0.9873
+Precision : 0.9863
+Recall    : 0.9893
+F1-Score  : 0.9878
+ROC-AUC   : 0.9989
+
+Confusion Matrix (rows=Actual, cols=Predicted):
+[[7801  118]
+ [  92 8486]]
+
+Full Classification Report:
+              precision    recall  f1-score   support
+
+           0      0.988     0.985     0.987      7919
+           1      0.986     0.989     0.988      8578
+
+    accuracy                          0.987     16497
+   macro avg      0.987     0.987     0.987     16497
+weighted avg      0.987     0.987     0.987     16497
