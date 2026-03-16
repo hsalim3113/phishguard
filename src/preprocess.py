@@ -1,20 +1,22 @@
 """
 preprocess.py — Data preprocessing pipeline for PhishGuard.
 
-This script reads a raw combined dataset CSV from data/raw/dataset.csv,
-which is expected to have two columns: 'text_combined' (the concatenated
-email subject and body) and 'label' (the class label in various string or
-integer formats depending on the source dataset).
+This script takes the raw combined dataset and gets it into a clean,
+consistent format that the training script can use directly.
 
-It performs the following steps:
-  1. Load the raw CSV
-  2. Drop rows with missing values in the two key columns
-  3. Strip HTML tags and normalise whitespace in the text column
-  4. Map all label variants ('spam', 'phishing', 'ham', 'legitimate', etc.)
-     to a consistent binary integer: 0 = legitimate, 1 = phishing
-  5. Drop any rows whose label could not be mapped
+The raw CSV (data/raw/dataset.csv) is expected to have two columns:
+  - 'text_combined' : the email subject and body joined into one string
+  - 'label'         : the class label, which varies by source dataset
+                      (e.g. 'spam', 'ham', 'phishing', '0', '1', etc.)
+
+What this script does:
+  1. Load the raw CSV (with a proper error message if it's missing)
+  2. Drop rows with missing values in either key column
+  3. Strip HTML tags and collapse whitespace in the text column
+  4. Map all the different label formats to a consistent 0/1 integer
+  5. Drop any rows whose label couldn't be mapped
   6. Save the cleaned dataset to data/processed/processed.csv
-  7. Print a class balance warning if either class is under 40% of the total
+  7. Print a warning if either class is under 40% of the total
 
 Input  : data/raw/dataset.csv
 Output : data/processed/processed.csv
@@ -32,8 +34,9 @@ def clean_text(s: str) -> str:
     """
     Clean a single email text string.
 
-    Removes HTML tags (e.g. from email clients that send HTML bodies) and
-    collapses any sequence of whitespace characters into a single space.
+    Some emails in the dataset were scraped with their HTML intact, so we
+    strip the tags out before training. We also collapse whitespace so the
+    vectoriser doesn't treat double-spaced text differently from single-spaced.
 
     Parameters
     ----------
@@ -46,9 +49,11 @@ def clean_text(s: str) -> str:
         The cleaned text with HTML stripped and whitespace normalised.
     """
     s = str(s)
-    # Remove HTML tags — some emails in the dataset contain raw HTML markup
+    # Some emails come through with full HTML markup still in the body —
+    # stripping it out so the model doesn't accidentally learn HTML tag patterns
     s = re.sub(r"<.*?>", " ", s)
-    # Collapse runs of whitespace (spaces, tabs, newlines) into one space
+    # Collapse any run of whitespace (tabs, newlines, multiple spaces) into
+    # a single space so the TF-IDF vectoriser sees consistent token boundaries
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -57,12 +62,11 @@ def main():
     """
     Run the full preprocessing pipeline.
 
-    Reads the raw dataset, cleans the text, normalises the labels, and writes
-    the processed output. Also prints dataset statistics and a class balance
-    warning if the distribution is skewed beyond the 40/60 threshold.
+    Reads the raw dataset, cleans the text, normalises the labels, saves the
+    output, and prints a class balance warning if the distribution looks skewed.
     """
-    # Try to load the raw dataset; give a clear error if the file is missing
-    # rather than letting pandas raise a confusing FileNotFoundError
+    # Catch a missing file before pandas does — the default FileNotFoundError
+    # message is easy to miss when running from a different working directory
     try:
         df = pd.read_csv(RAW_PATH)
     except FileNotFoundError:
@@ -75,15 +79,17 @@ def main():
     text_col = "text_combined"
     label_col = "label"
 
+    # Drop rows that are missing either the text or the label —
+    # we can't do anything useful with incomplete samples
     df = df[[text_col, label_col]].dropna()
     df[text_col] = df[text_col].apply(clean_text)
 
-    # Normalise label strings to lowercase and strip surrounding whitespace
-    # so that the mapping below handles any capitalisation variation
+    # Lowercase and strip before mapping so "Spam", "SPAM", and "spam" all
+    # resolve to the same key — the source datasets aren't consistent here
     df[label_col] = df[label_col].astype(str).str.lower().str.strip()
 
-    # Map every label variant found across the three source datasets to a
-    # consistent binary integer (0 = legitimate, 1 = phishing)
+    # The three datasets use completely different label formats, so we unify
+    # everything to a binary integer: 0 = legitimate, 1 = phishing
     mapping = {
         "0": 0,             # numeric string from datasets that pre-encoded labels
         "1": 1,             # numeric string from datasets that pre-encoded labels
@@ -95,20 +101,23 @@ def main():
     }
     df[label_col] = df[label_col].map(mapping)
 
-    # Drop rows where the label was not in the mapping (unmappable labels
-    # become NaN after .map(), so dropna() removes them cleanly)
+    # .map() silently turns any unrecognised label into NaN, so dropna()
+    # takes care of cleaning up any rows we couldn't handle
     df = df.dropna()
     df[label_col] = df[label_col].astype(int)
 
+    # Create the output directory if it doesn't exist yet
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(OUT_PATH, index=False)
     print(f"Saved: {OUT_PATH} rows={len(df)}")
     print(df[label_col].value_counts())
 
     # --- Class balance check ---
-    # A heavily skewed dataset (e.g. 95% phishing, 5% legitimate) can cause
-    # the model to appear accurate while actually just predicting the majority
-    # class — so we warn early if either class is under 40% of the total
+    # Class imbalance is a known problem with phishing datasets — if one class
+    # dominates, the model can look accurate just by always predicting that class.
+    # 40% is a rough threshold; anything below it is worth looking into before
+    # training, whether that means oversampling, undersampling, or adjusting
+    # class weights in the classifier
     total = len(df)
     for cls, label_name in [(0, "Legitimate"), (1, "Phishing")]:
         count = (df[label_col] == cls).sum()

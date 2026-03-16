@@ -1,15 +1,17 @@
 """
 train.py — Training pipeline for PhishGuard.
 
-This script handles the full model training process:
-  1. Load the preprocessed dataset from data/processed/processed.csv
-  2. Split the data into training and test sets (80/20 stratified split)
-  3. Vectorise the text using TF-IDF with bigrams and a 30,000-feature cap
-  4. Train a Logistic Regression classifier on the TF-IDF vectors
-  5. Evaluate the model on the held-out test set (accuracy, precision, recall,
-     F1-score, ROC-AUC, and confusion matrix)
-  6. Save the trained model and vectoriser to the models/ directory
-  7. Save evaluation results to outputs/evaluation/ for use by the Streamlit app
+This script runs the full training pipeline from preprocessed data to a
+saved model. The steps are:
+  1. Load the cleaned dataset from data/processed/processed.csv
+  2. Drop any remaining NaN rows and force string types on the text column
+  3. Split into 80/20 train/test sets using a stratified split
+  4. Vectorise the text with TF-IDF (bigrams, 30k features)
+  5. Train a Logistic Regression classifier
+  6. Evaluate on the held-out test set and print all key metrics
+  7. Save the model and vectoriser to models/
+  8. Write the evaluation report and a metrics JSON to outputs/evaluation/
+     so the Streamlit app can load the numbers without needing to retrain
 """
 
 import json
@@ -43,44 +45,54 @@ METRICS_PATH = EVAL_DIR / "metrics.json"
 def main():
     df = pd.read_csv(DATA_PATH)
 
-    # Drop any rows where text_combined is NaN — these would cause the
-    # vectoriser to fail or produce meaningless zero vectors
+    # Some rows end up with missing text after combining the three datasets —
+    # dropping them here rather than letting the vectoriser silently choke on NaN
     df = df.dropna(subset=["text_combined"])
 
     X = df["text_combined"]
     y = df["label"].astype(int)
 
-    # Convert everything to string to prevent type errors during vectorisation
-    # (e.g. if a cell was read as a float due to mixed column types)
+    # Pandas can read mixed-type columns as float (e.g. "nan" cells), so we
+    # force everything to string to avoid a type error inside the vectoriser
     X = X.astype(str)
 
-    # random_state=42 ensures the train/test split is identical every run,
-    # which makes results reproducible — important for a fair evaluation
+    # Fixing the random seed means the train/test split is identical on every
+    # run, so evaluation numbers are directly comparable if I retrain later
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
+    # max_features=30000 caps vocabulary size to keep memory usage reasonable;
+    # ngram_range=(1,2) adds bigrams so the model can pick up two-word patterns
+    # like "click here" or "verify account" that a unigram model would miss
     vec = TfidfVectorizer(max_features=30000, ngram_range=(1, 2), stop_words="english")
+
+    # fit_transform on training data only — fitting on the test set too
+    # would be data leakage and would inflate the evaluation scores
     X_train_vec = vec.fit_transform(X_train)
     X_test_vec = vec.transform(X_test)
 
-    # Logistic Regression was chosen over alternatives (e.g. SVM, Random Forest,
-    # neural networks) because:
-    #   - It is highly interpretable — coefficients map directly to word importance,
-    #     which pairs well with TF-IDF sparse vectors
-    #   - It trains quickly even on large sparse matrices, which is practical for
-    #     a university project with limited compute
-    #   - It produces well-calibrated probability estimates, making the confidence
-    #     score meaningful to the end user
+    # I considered SVM and Random Forest but chose Logistic Regression for
+    # three main reasons:
+    #   1. The coefficients map directly to word importance, which pairs well
+    #      with TF-IDF and makes the model easier to explain in the write-up
+    #   2. It trains quickly on large sparse matrices — important when I was
+    #      iterating on the dataset and retraining frequently during development
+    #   3. It gives properly calibrated probabilities rather than raw scores,
+    #      which means the confidence percentage shown in the UI actually means
+    #      something rather than being an arbitrary number
     model = LogisticRegression(max_iter=2000)
     model.fit(X_train_vec, y_train)
 
     y_pred = model.predict(X_test_vec)
-    # predict_proba gives us the probability for each class; we take class 1
-    # (phishing) for the ROC-AUC calculation
+
+    # predict_proba returns [P(legitimate), P(phishing)] for each sample —
+    # we only need the phishing probability (class 1) for the ROC-AUC score
     y_proba = model.predict_proba(X_test_vec)[:, 1]
 
-    # --- Individual metric print statements ---
+    # --- Evaluation metrics ---
+    # Computing each one separately so they can be printed clearly and
+    # saved to JSON for the Streamlit sidebar
     acc = accuracy_score(y_test, y_pred)
     prec = precision_score(y_test, y_pred)
     rec = recall_score(y_test, y_pred)
@@ -95,24 +107,26 @@ def main():
     print(f"ROC-AUC   : {roc_auc:.4f}")
 
     # --- Confusion matrix ---
-    # Rows = actual class, Columns = predicted class
-    # [TN  FP]
-    # [FN  TP]
+    # Layout is:  [TN  FP]
+    #             [FN  TP]
+    # False negatives (phishing labelled as legitimate) are the most
+    # dangerous error for this use case, so it's worth checking FN directly
     cm = confusion_matrix(y_test, y_pred)
     print("\n--- Confusion Matrix (rows=Actual, cols=Predicted) ---")
     print(f"                Predicted Legitimate  Predicted Phishing")
     print(f"Actual Legitimate      {cm[0][0]:<20} {cm[0][1]}")
     print(f"Actual Phishing        {cm[1][0]:<20} {cm[1][1]}")
 
-    # --- Full classification report ---
+    # Full sklearn report for completeness — includes per-class breakdown
     report = classification_report(y_test, y_pred, digits=3)
     print("\n--- Full Classification Report ---")
     print(report)
 
-    # --- Save evaluation outputs ---
+    # --- Persist evaluation outputs ---
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Save the full text report so it can be reviewed outside the terminal
+    # Write the full report to a file so I can review it later without
+    # having to retrain — useful when writing up the results section
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
         f.write("===== PhishGuard Model Evaluation Report =====\n\n")
         f.write(f"Accuracy  : {acc:.4f}\n")
@@ -126,8 +140,8 @@ def main():
         f.write(report)
     print(f"Saved evaluation report: {REPORT_PATH}")
 
-    # Save individual metrics as JSON so the Streamlit app can load and display
-    # them in the sidebar without needing to re-run training
+    # Dump the key metrics to JSON so the Streamlit sidebar can load and
+    # display them without needing to re-run training each time the app starts
     metrics = {
         "accuracy": round(acc, 4),
         "precision": round(prec, 4),

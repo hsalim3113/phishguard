@@ -10,17 +10,16 @@ def load_assets():
     """
     Load the trained model and TF-IDF vectoriser from disk.
 
-    Both files are saved by train.py using joblib serialisation.
-    This function is called once at app startup (cached by Streamlit) so
-    that every prediction request reuses the same in-memory objects rather
-    than reading from disk each time.
+    Both files are saved by train.py using joblib. In the Streamlit app this
+    function is wrapped in @st.cache_resource, so it only reads from disk once
+    per session rather than on every button click.
 
     Returns
     -------
     tuple
         (model, vec) where:
           - model : sklearn LogisticRegression — the trained classifier
-          - vec   : sklearn TfidfVectorizer — the fitted vectoriser
+          - vec   : sklearn TfidfVectorizer    — the fitted vectoriser
     """
     model = load(MODEL_PATH)
     vec = load(VEC_PATH)
@@ -38,35 +37,38 @@ def predict_email(model, vec, subject: str, body: str):
     vec : sklearn TfidfVectorizer
         The fitted vectoriser returned by load_assets().
     subject : str
-        The email subject line (may be empty string but not both subject
-        and body empty at the same time).
+        The email subject line. Can be empty, but not both subject and body.
     body : str
-        The email body text (may be empty string but not both subject
-        and body empty at the same time).
+        The email body text. Can be empty, but not both subject and body.
 
     Returns
     -------
     tuple
         (label, confidence, combined_text) where:
-          - label          : str   — 'phishing' or 'legitimate'
-          - confidence     : float — probability of the predicted class (0–1)
-          - combined_text  : str   — the joined text that was passed to the model
+          - label         : str   — 'phishing' or 'legitimate'
+          - confidence    : float — probability of the predicted class (0–1)
+          - combined_text : str   — the text that was actually passed to the model
 
     Raises
     ------
     ValueError
         If both subject and body are empty strings after stripping whitespace.
     """
-    # Validate input early so the rest of the function can assume non-empty text
+    # Catch empty input before it reaches the model — an empty string would
+    # produce a valid but completely meaningless TF-IDF vector full of zeros
     if not (subject or "").strip() and not (body or "").strip():
         raise ValueError("Email subject and body cannot both be empty")
 
-    # Subject and body are joined with a newline so the vectoriser sees them as
-    # a single document, which is consistent with how the training data was
-    # structured in preprocess.py (text_combined = subject + "\n" + body)
+    # Join subject and body the same way the training data was constructed in
+    # preprocess.py — if the format here differs from training, the model is
+    # effectively seeing a slightly different type of input than it was trained on
     text = (subject or "").strip() + "\n" + (body or "").strip()
 
+    # Vectorise using the same fitted vectoriser as training
     X = vec.transform([text])
+
+    # predict_proba returns [P(legitimate), P(phishing)] — argmax gives the
+    # index of the winning class, and max gives the confidence score
     proba = model.predict_proba(X)[0]
     pred_idx = int(np.argmax(proba))
     conf = float(np.max(proba))
