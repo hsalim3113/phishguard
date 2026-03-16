@@ -178,6 +178,14 @@ if st.button("Analyse email"):
     coef_df = coef_df.reset_index(drop=True)
     # Round to 3 decimal places for consistency with the LIME table above
     coef_df["Contribution Score"] = coef_df["Contribution Score"].round(3)
+    st.info(
+        "**How to read this table:** Each row shows a word from the training data "
+        "and its learned model weight. A **positive score** means that word is a "
+        "strong indicator of **Phishing** emails in general. A **negative score** "
+        "means that word is strongly associated with **Legitimate** emails. The "
+        "larger the absolute value, the more influential that word is across the "
+        "entire dataset — not just this specific email."
+    )
     st.dataframe(coef_df, use_container_width=True)
     st.caption(
         "Positive scores indicate words associated with phishing across the entire "
