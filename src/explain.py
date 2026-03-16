@@ -40,10 +40,13 @@ def build_explainer():
     LimeTextExplainer
         A configured LIME explainer instance ready to explain text predictions.
     """
-    return LimeTextExplainer(class_names=["legitimate", "phishing"])
+    # random_state=42 makes LIME deterministic — without this, the random
+    # perturbations change on every call, so the same email can produce
+    # slightly different explanations each time, which is confusing for users
+    return LimeTextExplainer(class_names=["legitimate", "phishing"], random_state=42)
 
 
-def explain_with_lime(explainer, model, vec, text: str, num_features: int = 10):
+def explain_with_lime(explainer, model, vec, text: str, num_features: int = 15):
     """
     Generate a LIME explanation for a single email text.
 
@@ -51,6 +54,10 @@ def explain_with_lime(explainer, model, vec, text: str, num_features: int = 10):
     individual words) and observing how the model's prediction changes. It then
     fits a simple linear model to approximate the classifier's behaviour
     locally around this specific input.
+
+    We ask LIME for 15 candidate features but then filter down to the top 10
+    by absolute weight — this ensures the final list always contains the most
+    impactful words rather than whatever LIME happens to rank first internally.
 
     Parameters
     ----------
@@ -63,12 +70,14 @@ def explain_with_lime(explainer, model, vec, text: str, num_features: int = 10):
     text : str
         The combined email text (subject + body) to explain.
     num_features : int, optional
-        The number of top contributing words/phrases to return (default 10).
+        Number of candidate features to request from LIME before filtering
+        (default 15). The function always returns at most 10 after filtering.
 
     Returns
     -------
     list of tuple
-        A list of (word, weight) tuples sorted by absolute weight descending.
+        A list of up to 10 (word, weight) tuples sorted by absolute weight
+        descending.
         Positive weight → pushes towards phishing.
         Negative weight → pushes towards legitimate.
     """
@@ -77,16 +86,32 @@ def explain_with_lime(explainer, model, vec, text: str, num_features: int = 10):
         X = vec.transform(texts)
         return model.predict_proba(X)
 
+    # num_samples=1000 increases the number of perturbed neighbourhood samples
+    # LIME generates — more samples means a more stable local linear approximation
+    # and consistent results across runs (default is 5000 but that is slow;
+    # 1000 is a good balance between speed and stability for a live web app)
+    #
+    # distance_metric='cosine' is better suited to high-dimensional TF-IDF
+    # vectors than the default euclidean distance, because cosine similarity
+    # captures the angle between vectors rather than their absolute magnitude,
+    # which is more meaningful when comparing sparse text representations
     exp = explainer.explain_instance(
         text_instance=text,
         classifier_fn=predict_proba,
-        num_features=num_features
+        num_features=num_features,
+        num_samples=1000,
+        distance_metric="cosine",
     )
 
     # exp.as_list() returns [(word, weight), ...] where:
     #   positive weight → that word pushes the model towards predicting phishing
     #   negative weight → that word pushes the model towards predicting legitimate
-    return exp.as_list()
+    all_weights = exp.as_list()
+
+    # Filter to the top 10 by absolute contribution so the UI always shows
+    # the most impactful words, not just the first 10 LIME happened to rank
+    top_weights = sorted(all_weights, key=lambda x: abs(x[1]), reverse=True)[:10]
+    return top_weights
 
 
 def explain_with_coefficients(model, vec, text: str, top_n: int = 10):

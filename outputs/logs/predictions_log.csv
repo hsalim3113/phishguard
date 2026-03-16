@@ -12,3 +12,5 @@ timestamp,prediction,confidence,text_length
 2026-02-04T19:29:29,legitimate,0.9339,124
 2026-02-04T19:31:00,phishing,0.9913,115
 2026-03-16T11:34:41,phishing,0.9156,143
+2026-03-16T12:02:22,phishing,0.9962,589
+2026-03-16T12:04:24,legitimate,0.9959,217

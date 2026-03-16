@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 from predict import load_assets, predict_email
-from explain import build_explainer, explain_with_lime
+from explain import build_explainer, explain_with_lime, explain_with_coefficients
 
 LOG_DIR = Path("outputs/logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,12 +51,38 @@ with st.sidebar:
         try:
             with open(METRICS_PATH, "r", encoding="utf-8") as f:
                 metrics = json.load(f)
-            # Display each metric as a percentage-style figure for readability
-            st.metric("Accuracy",  f"{metrics.get('accuracy',  0):.2%}")
+            # Display each metric as a percentage-style figure for readability,
+            # followed by a plain English caption so non-technical users understand
+            # what each number actually means
+            st.metric("Accuracy", f"{metrics.get('accuracy', 0):.2%}")
+            st.caption(
+                "Out of every 100 emails, the model correctly identifies approximately "
+                f"{metrics.get('accuracy', 0) * 100:.0f} as either phishing or legitimate."
+            )
+
             st.metric("Precision", f"{metrics.get('precision', 0):.2%}")
-            st.metric("Recall",    f"{metrics.get('recall',    0):.2%}")
-            st.metric("F1-Score",  f"{metrics.get('f1_score',  0):.2%}")
-            st.metric("ROC-AUC",   f"{metrics.get('roc_auc',   0):.4f}")
+            st.caption(
+                "When the model flags an email as phishing, it is correct approximately "
+                f"{metrics.get('precision', 0) * 100:.0f}% of the time."
+            )
+
+            st.metric("Recall", f"{metrics.get('recall', 0):.2%}")
+            st.caption(
+                "The model successfully catches approximately "
+                f"{metrics.get('recall', 0) * 100:.0f} out of every 100 actual phishing emails."
+            )
+
+            st.metric("F1-Score", f"{metrics.get('f1_score', 0):.2%}")
+            st.caption(
+                "The overall balance between precision and recall. "
+                "A score above 95% is considered excellent."
+            )
+
+            st.metric("ROC-AUC", f"{metrics.get('roc_auc', 0):.4f}")
+            st.caption(
+                "Measures how well the model separates phishing from legitimate emails. "
+                "1.0 is a perfect score. Anything above 0.99 is exceptional."
+            )
         except (json.JSONDecodeError, KeyError):
             st.caption("Metrics file could not be parsed.")
     else:
@@ -116,17 +142,47 @@ if st.button("Analyse email"):
 
     st.subheader("Explanation (top contributing words)")
 
-    weights = explain_with_lime(explainer, model, vec, combined_text, num_features=10)
+    weights = explain_with_lime(explainer, model, vec, combined_text, num_features=15)
+
+    import pandas as pd
+
+    # Plain English key so users know how to interpret the table without
+    # needing any machine learning background
+    st.info(
+        "**How to read this table:** Each row shows a word or phrase from your "
+        "email and how much it influenced the result. A **positive score** means "
+        "that word pushed the classification towards **Phishing**. A **negative "
+        "score** means it pushed towards **Legitimate**. The larger the number, "
+        "the stronger the influence."
+    )
 
     # Build a tidy dataframe sorted by how strongly each word influenced the
     # decision (positive = towards phishing, negative = towards legitimate)
-    import pandas as pd
     explanation_df = pd.DataFrame(weights, columns=["Word or Phrase", "Contribution Score"])
     explanation_df = explanation_df.reindex(
         explanation_df["Contribution Score"].abs().sort_values(ascending=False).index
     )
     explanation_df = explanation_df.reset_index(drop=True)
+    # Round to 3 decimal places so the table is readable at a glance
+    explanation_df["Contribution Score"] = explanation_df["Contribution Score"].round(3)
     st.dataframe(explanation_df, use_container_width=True)
+
+    # --- Model Coefficient Analysis ---
+    # A second complementary view: instead of LIME's local perturbation scores,
+    # this shows the model's global learned weights multiplied by TF-IDF score,
+    # giving a direct measure of each word's influence based on training data
+    st.subheader("Model Coefficient Analysis")
+
+    coef_weights = explain_with_coefficients(model, vec, combined_text, top_n=10)
+    coef_df = pd.DataFrame(coef_weights, columns=["Word or Phrase", "Contribution Score"])
+    coef_df = coef_df.reset_index(drop=True)
+    # Round to 3 decimal places for consistency with the LIME table above
+    coef_df["Contribution Score"] = coef_df["Contribution Score"].round(3)
+    st.dataframe(coef_df, use_container_width=True)
+    st.caption(
+        "Positive scores indicate words associated with phishing across the entire "
+        "training dataset. Negative scores indicate words associated with legitimate emails."
+    )
 
     # Log only metadata — never the email content — for later evaluation
     ts = datetime.now().isoformat(timespec="seconds")
