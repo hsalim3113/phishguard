@@ -12,7 +12,7 @@ built as a final-year Computer Science project at the University of Westminster.
 https://sites.google.com/view/phishguard-westminster
 
 ## Try the App
-https://phishguard.streamlit.app
+https://phishguarduk.streamlit.app/
 
 ## Built With
 - Python
