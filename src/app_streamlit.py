@@ -35,6 +35,32 @@ from explain import build_explainer, explain_with_lime, explain_with_shap
 from predict import load_assets, predict_email
 
 # ---------------------------------------------------------------------------
+# Model download
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = _SRC.parent
+_MODEL_FILES = {
+    _PROJECT_ROOT / "models" / "model_logreg.joblib": "15wf-k9wEHuCvq6tZbsoRyOOgvfuuGWyv",
+    _PROJECT_ROOT / "models" / "tfidf_vectorizer.joblib": "1B0Dgp72Hip6tr2mm2sRig3xH2Gx3ijPb",
+}
+
+
+def download_models() -> None:
+    """Download model files from Google Drive if they don't already exist locally."""
+    import gdown
+
+    (_PROJECT_ROOT / "models").mkdir(parents=True, exist_ok=True)
+    for dest, file_id in _MODEL_FILES.items():
+        if not dest.exists():
+            gdown.download(
+                f"https://drive.google.com/uc?id={file_id}",
+                str(dest),
+                quiet=False,
+            )
+
+
+download_models()
+
+# ---------------------------------------------------------------------------
 # App config and startup
 # ---------------------------------------------------------------------------
 st.set_page_config(
