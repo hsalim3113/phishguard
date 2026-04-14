@@ -109,8 +109,13 @@ with st.sidebar:
     with st.expander("View evaluation results", expanded=False):
         report_path = CLASSIFICATION_REPORT_JSON
         if report_path.exists():
-            with open(report_path, encoding="utf-8") as f:
-                report = json.load(f)
+            try:
+                report = json.loads(report_path.read_bytes().decode("utf-8-sig"))
+            except Exception:
+                report = None
+        else:
+            report = None
+        if report is not None:
             rows = []
             for cls in ["Legitimate", "Phishing", "weighted avg"]:
                 key = cls.lower() if cls == "Legitimate" else cls
@@ -130,8 +135,6 @@ with st.sidebar:
             acc = report.get("accuracy")
             if acc:
                 st.metric("Overall accuracy", f"{acc:.3f}")
-        else:
-            st.info("Run `python src/train.py` to generate evaluation results.")
 
         if CONFUSION_MATRIX_PNG.exists():
             st.image(str(CONFUSION_MATRIX_PNG), caption="Confusion Matrix", use_container_width=True)
@@ -161,8 +164,13 @@ with st.expander("About this model"):
     with col2:
         stats_path = DATASET_STATS_JSON
         if stats_path.exists():
-            with open(stats_path, encoding="utf-8") as f:
-                stats = json.load(f)
+            try:
+                stats = json.loads(stats_path.read_bytes().decode("utf-8-sig"))
+            except Exception:
+                stats = None
+        else:
+            stats = None
+        if stats is not None:
             st.markdown(
                 f"**Training samples:** {stats.get('total_samples', 'N/A'):,}  \n"
                 f"**Legitimate:** {stats.get('n_legitimate', 'N/A'):,} "
@@ -170,8 +178,6 @@ with st.expander("About this model"):
                 f"**Phishing:** {stats.get('n_phishing', 'N/A'):,} "
                 f"({stats.get('pct_phishing', '?')}%)"
             )
-        else:
-            st.info("Run `python src/preprocess.py` to see dataset statistics.")
 
         comp_path = MODEL_COMPARISON_CSV
         if comp_path.exists():
