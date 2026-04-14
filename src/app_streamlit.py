@@ -35,21 +35,27 @@ from explain import build_explainer, explain_with_lime, explain_with_shap
 from predict import load_assets, predict_email
 
 # ---------------------------------------------------------------------------
-# Model download
+# Asset download
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = _SRC.parent
-_MODEL_FILES = {
+_REMOTE_FILES = {
     _PROJECT_ROOT / "models" / "model_logreg.joblib": "15wf-k9wEHuCvq6tZbsoRyOOgvfuuGWyv",
     _PROJECT_ROOT / "models" / "tfidf_vectorizer.joblib": "1B0Dgp72Hip6tr2mm2sRig3xH2Gx3ijPb",
+    _PROJECT_ROOT / "outputs" / "evaluation" / "classification_report.json": "143eAOiC-FDjayJ2JNC5_OG3YVrO9Jr7C",
+    _PROJECT_ROOT / "outputs" / "evaluation" / "confusion_matrix.png": "1roqqL-GvLC7LaQIKd7CPcJVL7MWItSwL",
+    _PROJECT_ROOT / "outputs" / "evaluation" / "roc_curve.png": "15i8LTWgRnkywCq-G4udOBNLOJc7lj3oc",
+    _PROJECT_ROOT / "outputs" / "evaluation" / "model_comparison.png": "1LWkhLuAFd4-2rkIUjRX9qMQFvUVRiDwl",
+    _PROJECT_ROOT / "outputs" / "evaluation" / "dataset_stats.json": "1s-jhnadbgYSZB9e1dtWWjvm2um658FcH",
 }
 
 
-def download_models() -> None:
-    """Download model files from Google Drive if they don't already exist locally."""
+def download_assets() -> None:
+    """Download model and evaluation files from Google Drive if they don't already exist locally."""
     import gdown
 
     (_PROJECT_ROOT / "models").mkdir(parents=True, exist_ok=True)
-    for dest, file_id in _MODEL_FILES.items():
+    (_PROJECT_ROOT / "outputs" / "evaluation").mkdir(parents=True, exist_ok=True)
+    for dest, file_id in _REMOTE_FILES.items():
         if not dest.exists():
             gdown.download(
                 f"https://drive.google.com/uc?id={file_id}",
@@ -58,7 +64,7 @@ def download_models() -> None:
             )
 
 
-download_models()
+download_assets()
 
 # ---------------------------------------------------------------------------
 # App config and startup
