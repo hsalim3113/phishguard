@@ -43,7 +43,7 @@ _REMOTE_FILES = {
     _PROJECT_ROOT / "models" / "tfidf_vectorizer.joblib": "1B0Dgp72Hip6tr2mm2sRig3xH2Gx3ijPb",
     _PROJECT_ROOT / "outputs" / "evaluation" / "classification_report.json": "143eAOiC-FDjayJ2JNC5_OG3YVrO9Jr7C",
     _PROJECT_ROOT / "outputs" / "evaluation" / "confusion_matrix.png": "1roqqL-GvLC7LaQIKd7CPcJVL7MWItSwL",
-    _PROJECT_ROOT / "outputs" / "evaluation" / "roc_curve.png": "15i8LTWgRnkywCq-G4udOBNLOJc7lj3oc",
+    _PROJECT_ROOT / "outputs" / "evaluation" / "roc_curve.png": "1f5mqPfdUkD4kJZYZ2kTwmKLpn2phPasK",
     _PROJECT_ROOT / "outputs" / "evaluation" / "model_comparison.png": "1LWkhLuAFd4-2rkIUjRX9qMQFvUVRiDwl",
     _PROJECT_ROOT / "outputs" / "evaluation" / "dataset_stats.json": "1s-jhnadbgYSZB9e1dtWWjvm2um658FcH",
 }
@@ -55,6 +55,9 @@ def download_assets() -> None:
 
     (_PROJECT_ROOT / "models").mkdir(parents=True, exist_ok=True)
     (_PROJECT_ROOT / "outputs" / "evaluation").mkdir(parents=True, exist_ok=True)
+    roc_path = _PROJECT_ROOT / "outputs" / "evaluation" / "roc_curve.png"
+    if roc_path.exists():
+        roc_path.unlink()
     for dest, file_id in _REMOTE_FILES.items():
         if not dest.exists():
             gdown.download(
