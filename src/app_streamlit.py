@@ -37,35 +37,27 @@ from predict import load_assets, predict_email
 # ---------------------------------------------------------------------------
 # Asset download
 # ---------------------------------------------------------------------------
-_PROJECT_ROOT = _SRC.parent
-_REMOTE_FILES = {
-    _PROJECT_ROOT / "models" / "model_logreg.joblib": "15wf-k9wEHuCvq6tZbsoRyOOgvfuuGWyv",
-    _PROJECT_ROOT / "models" / "tfidf_vectorizer.joblib": "1B0Dgp72Hip6tr2mm2sRig3xH2Gx3ijPb",
-    _PROJECT_ROOT / "outputs" / "evaluation" / "classification_report.json": "143eAOiC-FDjayJ2JNC5_OG3YVrO9Jr7C",
-    _PROJECT_ROOT / "outputs" / "evaluation" / "confusion_matrix.png": "1roqqL-GvLC7LaQIKd7CPcJVL7MWItSwL",
-    _PROJECT_ROOT / "outputs" / "evaluation" / "roc_curve.png": "1f5mqPfdUkD4kJZYZ2kTwmKLpn2phPasK",
-    _PROJECT_ROOT / "outputs" / "evaluation" / "model_comparison.png": "1LWkhLuAFd4-2rkIUjRX9qMQFvUVRiDwl",
-    _PROJECT_ROOT / "outputs" / "evaluation" / "dataset_stats.json": "1s-jhnadbgYSZB9e1dtWWjvm2um658FcH",
-}
+import requests
 
 
 def download_assets() -> None:
-    """Download model and evaluation files from Google Drive if they don't already exist locally."""
-    import gdown
+    """Download model and evaluation files from GitHub releases if they don't already exist locally."""
+    _base = "https://github.com/hsalim3113/phishguard/releases/download/v1.0"
+    files = {
+        Path("models/model_logreg.joblib"): f"{_base}/model_logreg.joblib",
+        Path("models/tfidf_vectorizer.joblib"): f"{_base}/tfidf_vectorizer.joblib",
+        Path("outputs/evaluation/classification_report.json"): f"{_base}/classification_report.json",
+        Path("outputs/evaluation/confusion_matrix.png"): f"{_base}/confusion_matrix.png",
+        Path("outputs/evaluation/roc_curve.png"): f"{_base}/roc_curve.png",
+        Path("outputs/evaluation/model_comparison.png"): f"{_base}/model_comparison.png",
+        Path("outputs/evaluation/dataset_stats.json"): f"{_base}/dataset_stats.json",
+    }
 
-    (_PROJECT_ROOT / "models").mkdir(parents=True, exist_ok=True)
-    (_PROJECT_ROOT / "outputs" / "evaluation").mkdir(parents=True, exist_ok=True)
-    roc_path = _PROJECT_ROOT / "outputs" / "evaluation" / "roc_curve.png"
-    if roc_path.exists():
-        roc_path.unlink()
-    for dest, file_id in _REMOTE_FILES.items():
+    for dest, url in files.items():
+        dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists():
-            gdown.download(
-                f"https://drive.google.com/uc?id={file_id}",
-                str(dest),
-                quiet=False,
-                fuzzy=True,
-            )
+            response = requests.get(url)
+            dest.write_bytes(response.content)
 
 
 try:
