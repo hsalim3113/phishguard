@@ -64,10 +64,14 @@ def download_assets() -> None:
                 f"https://drive.google.com/uc?id={file_id}",
                 str(dest),
                 quiet=False,
+                fuzzy=True,
             )
 
 
-download_assets()
+try:
+    download_assets()
+except Exception as e:
+    st.warning(f"Some assets could not be downloaded: {e}")
 
 # ---------------------------------------------------------------------------
 # App config and startup
