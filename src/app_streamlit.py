@@ -6,13 +6,14 @@ Run from the project root:
 
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
+import requests
 import streamlit as st
 
 # Add src/ to the path so imports work from the project root or inside src/
@@ -37,8 +38,6 @@ from predict import load_assets, predict_email
 # ---------------------------------------------------------------------------
 # Asset download
 # ---------------------------------------------------------------------------
-import requests
-
 
 def download_assets() -> None:
     """Download model and evaluation files from GitHub releases if they don't already exist locally."""
@@ -64,6 +63,173 @@ try:
     download_assets()
 except Exception as e:
     st.warning(f"Some assets could not be downloaded: {e}")
+
+# ---------------------------------------------------------------------------
+# Firebase helpers
+# ---------------------------------------------------------------------------
+
+@st.cache_resource
+def _pyrebase_auth():
+    """Initialise pyrebase4 and return the Auth object."""
+    import pyrebase
+    cfg = st.secrets["firebase"]
+    config = {
+        "apiKey": cfg["apiKey"],
+        "authDomain": cfg["authDomain"],
+        "projectId": cfg["projectId"],
+        "storageBucket": cfg["storageBucket"],
+        "messagingSenderId": cfg["messagingSenderId"],
+        "appId": cfg["appId"],
+        "databaseURL": cfg.get("databaseURL", ""),
+    }
+    return pyrebase.initialize_app(config).auth()
+
+
+@st.cache_resource
+def _firestore_client():
+    """Initialise and return a Firestore client using the service account from secrets."""
+    try:
+        from google.oauth2 import service_account
+        from google.cloud import firestore
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        credentials = service_account.Credentials.from_service_account_info(creds_dict)
+        return firestore.Client(credentials=credentials, project=creds_dict["project_id"])
+    except Exception:
+        return None
+
+
+def _auth_error_message(exc: Exception) -> str:
+    msg = str(exc)
+    if "INVALID_PASSWORD" in msg or "EMAIL_NOT_FOUND" in msg or "INVALID_LOGIN_CREDENTIALS" in msg:
+        return "Invalid email or password."
+    if "EMAIL_EXISTS" in msg:
+        return "An account with this email already exists."
+    if "WEAK_PASSWORD" in msg:
+        return "Password must be at least 6 characters."
+    if "INVALID_EMAIL" in msg:
+        return "Please enter a valid email address."
+    return f"Authentication error: {exc}"
+
+
+def show_auth_page() -> None:
+    """Render the login / register page. Sets st.session_state.user on success."""
+    st.title("🛡️ PhishGuard")
+    st.write("Sign in to access the phishing detector.")
+
+    tab_login, tab_register = st.tabs(["Login", "Register"])
+
+    with tab_login:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login", type="primary", key="btn_login"):
+            if not email or not password:
+                st.error("Please enter your email and password.")
+            else:
+                try:
+                    auth = _pyrebase_auth()
+                    user = auth.sign_in_with_email_and_password(email, password)
+                    info = auth.get_account_info(user["idToken"])
+                    display_name = info["users"][0].get("displayName") or email.split("@")[0]
+                    st.session_state.user = {
+                        "uid": user["localId"],
+                        "email": email,
+                        "display_name": display_name,
+                        "id_token": user["idToken"],
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    st.error(_auth_error_message(exc))
+
+    with tab_register:
+        display_name = st.text_input("Display name", key="reg_name")
+        email = st.text_input("Email", key="reg_email")
+        password = st.text_input("Password", type="password", key="reg_password")
+        if st.button("Create account", type="primary", key="btn_register"):
+            if not display_name or not email or not password:
+                st.error("Please fill in all fields.")
+            else:
+                try:
+                    auth = _pyrebase_auth()
+                    user = auth.create_user_with_email_and_password(email, password)
+                    auth.update_profile(user["idToken"], display_name=display_name)
+                    st.session_state.user = {
+                        "uid": user["localId"],
+                        "email": email,
+                        "display_name": display_name,
+                        "id_token": user["idToken"],
+                    }
+                    st.rerun()
+                except Exception as exc:
+                    st.error(_auth_error_message(exc))
+
+
+# ---------------------------------------------------------------------------
+# Firestore operations
+# ---------------------------------------------------------------------------
+
+def save_prediction(uid: str, subject: str, label: str, confidence: float,
+                    top_features: list) -> None:
+    """Save a prediction result to Firestore under the user's document."""
+    db = _firestore_client()
+    if db is None:
+        return
+    try:
+        db.collection("users").document(uid).collection("predictions").add({
+            "timestamp": datetime.now(timezone.utc),
+            "subject": subject[:200],
+            "label": label,
+            "confidence": round(confidence, 4),
+            "top_features": top_features[:3],
+        })
+    except Exception:
+        pass
+
+
+def get_history(uid: str) -> list:
+    """Return the user's last 10 predictions from Firestore, newest first."""
+    db = _firestore_client()
+    if db is None:
+        return []
+    try:
+        docs = (
+            db.collection("users").document(uid).collection("predictions")
+            .order_by("timestamp", direction="DESCENDING")
+            .limit(10)
+            .stream()
+        )
+        return [doc.to_dict() for doc in docs]
+    except Exception:
+        return []
+
+
+def save_quiz_score(uid: str, score: int, total: int) -> None:
+    """Save the quiz score to Firestore if it beats the user's current best."""
+    db = _firestore_client()
+    if db is None:
+        return
+    try:
+        ref = db.collection("users").document(uid)
+        doc = ref.get()
+        current_best = doc.to_dict().get("quiz_best_score", 0) if doc.exists else 0
+        if score > current_best:
+            ref.set({"quiz_best_score": score, "quiz_total": total}, merge=True)
+    except Exception:
+        pass
+
+
+def get_best_quiz_score(uid: str) -> int:
+    """Return the user's best quiz score from Firestore."""
+    db = _firestore_client()
+    if db is None:
+        return 0
+    try:
+        doc = db.collection("users").document(uid).get()
+        if doc.exists:
+            return doc.to_dict().get("quiz_best_score", 0)
+    except Exception:
+        pass
+    return 0
+
 
 # ---------------------------------------------------------------------------
 # App config and startup
@@ -100,11 +266,29 @@ except Exception:
     )
     st.stop()
 
+# ---------------------------------------------------------------------------
+# Authentication gate — show login/register page if not signed in
+# ---------------------------------------------------------------------------
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if st.session_state.user is None:
+    show_auth_page()
+    st.stop()
+
+_user = st.session_state.user
 
 # ---------------------------------------------------------------------------
-# Sidebar, shows the evaluation metrics saved by train.py
+# Sidebar — user info, logout, model performance, and prediction history
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    st.markdown(f"**{_user['display_name']}**  \n{_user['email']}")
+    if st.button("Logout", key="btn_logout"):
+        st.session_state.user = None
+        st.rerun()
+
+    st.divider()
+
     st.header("Model Performance")
     with st.expander("View evaluation results", expanded=False):
         report_path = CLASSIFICATION_REPORT_JSON
@@ -141,6 +325,26 @@ with st.sidebar:
 
         if ROC_CURVE_PNG.exists():
             st.image(str(ROC_CURVE_PNG), caption="ROC Curve", use_container_width=True)
+
+    st.divider()
+
+    st.subheader("My History")
+    with st.expander("Last 10 predictions", expanded=False):
+        history = get_history(_user["uid"])
+        if history:
+            for entry in history:
+                ts = entry.get("timestamp")
+                if hasattr(ts, "strftime"):
+                    ts_str = ts.strftime("%d %b %H:%M")
+                else:
+                    ts_str = str(ts)[:16]
+                label_h = entry.get("label", "?")
+                conf_h = entry.get("confidence", 0)
+                subj_h = (entry.get("subject") or "")[:40]
+                icon = "🚨" if label_h == "phishing" else "✅"
+                st.caption(f"{icon} **{label_h}** {conf_h:.0%} — {ts_str}  \n*{subj_h}*")
+        else:
+            st.caption("No predictions yet.")
 
     st.divider()
     st.caption("Phishing Detector Prototype — educational use only")
@@ -419,6 +623,11 @@ with tab_analyser:
                         "normal correspondence than phishing attempts."
                     )
 
+        # Save prediction to Firestore
+        top_features = [w[0] for w in sorted(weights, key=lambda x: abs(x[1]),
+                                              reverse=True)[:3]] if weights else []
+        save_prediction(_user["uid"], subject, label, confidence, top_features)
+
         # Only log metadata, not the actual email content
         ts = datetime.now().isoformat(timespec="seconds")
         log_line = f"{ts},{label},{confidence:.4f},{len(combined_text)}\n"
@@ -569,6 +778,8 @@ with tab_training:
         st.session_state.tm_result_weights = []
     if "tm_user_guess" not in st.session_state:
         st.session_state.tm_user_guess = None
+    if "tm_score_saved" not in st.session_state:
+        st.session_state.tm_score_saved = False
 
     # -------------------------------------------------------------------------
     # Restart button — always visible at the top so people can reset without
@@ -583,6 +794,7 @@ with tab_training:
         st.session_state.tm_result_confidence = None
         st.session_state.tm_result_weights = []
         st.session_state.tm_user_guess = None
+        st.session_state.tm_score_saved = False
         st.rerun()
 
     st.divider()
@@ -597,8 +809,19 @@ with tab_training:
         score = st.session_state.tm_score
         pct = round(score / TOTAL_EXAMPLES * 100)
 
+        # Save score to Firestore (once per completed run)
+        if not st.session_state.tm_score_saved:
+            save_quiz_score(_user["uid"], score, TOTAL_EXAMPLES)
+            st.session_state.tm_score_saved = True
+
+        best = get_best_quiz_score(_user["uid"])
+
         st.subheader("Exercise complete!")
-        st.metric("Final score", f"{score} / {TOTAL_EXAMPLES} ({pct}%)")
+        col_score, col_best = st.columns(2)
+        with col_score:
+            st.metric("Final score", f"{score} / {TOTAL_EXAMPLES} ({pct}%)")
+        with col_best:
+            st.metric("Your best score", f"{best} / {TOTAL_EXAMPLES}")
 
         if pct == 100:
             st.success("Perfect score — you spotted everything!")
