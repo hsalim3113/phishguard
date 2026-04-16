@@ -68,21 +68,46 @@ except Exception as e:
 # Firebase helpers
 # ---------------------------------------------------------------------------
 
-@st.cache_resource
-def _pyrebase_auth():
-    """Initialise pyrebase4 and return the Auth object."""
-    import pyrebase
-    cfg = st.secrets["firebase"]
-    config = {
-        "apiKey": cfg["apiKey"],
-        "authDomain": cfg["authDomain"],
-        "projectId": cfg["projectId"],
-        "storageBucket": cfg["storageBucket"],
-        "messagingSenderId": cfg["messagingSenderId"],
-        "appId": cfg["appId"],
-        "databaseURL": cfg.get("databaseURL", ""),
-    }
-    return pyrebase.initialize_app(config).auth()
+_FIREBASE_AUTH_BASE = "https://identitytoolkit.googleapis.com/v1/accounts"
+
+
+def _api_key() -> str:
+    return st.secrets["firebase"]["apiKey"]
+
+
+def _firebase_post(endpoint: str, payload: dict) -> dict:
+    url = f"{_FIREBASE_AUTH_BASE}:{endpoint}?key={_api_key()}"
+    resp = requests.post(url, json=payload, timeout=10)
+    data = resp.json()
+    if not resp.ok:
+        error_msg = data.get("error", {}).get("message", "UNKNOWN_ERROR")
+        raise Exception(error_msg)
+    return data
+
+
+def firebase_sign_in(email: str, password: str) -> dict:
+    return _firebase_post(
+        "signInWithPassword",
+        {"email": email, "password": password, "returnSecureToken": True},
+    )
+
+
+def firebase_register(email: str, password: str) -> dict:
+    return _firebase_post(
+        "signUp",
+        {"email": email, "password": password, "returnSecureToken": True},
+    )
+
+
+def firebase_get_account_info(id_token: str) -> dict:
+    return _firebase_post("lookup", {"idToken": id_token})
+
+
+def firebase_update_profile(id_token: str, display_name: str) -> dict:
+    return _firebase_post(
+        "update",
+        {"idToken": id_token, "displayName": display_name, "returnSecureToken": True},
+    )
 
 
 @st.cache_resource
@@ -126,9 +151,8 @@ def show_auth_page() -> None:
                 st.error("Please enter your email and password.")
             else:
                 try:
-                    auth = _pyrebase_auth()
-                    user = auth.sign_in_with_email_and_password(email, password)
-                    info = auth.get_account_info(user["idToken"])
+                    user = firebase_sign_in(email, password)
+                    info = firebase_get_account_info(user["idToken"])
                     display_name = info["users"][0].get("displayName") or email.split("@")[0]
                     st.session_state.user = {
                         "uid": user["localId"],
@@ -149,9 +173,8 @@ def show_auth_page() -> None:
                 st.error("Please fill in all fields.")
             else:
                 try:
-                    auth = _pyrebase_auth()
-                    user = auth.create_user_with_email_and_password(email, password)
-                    auth.update_profile(user["idToken"], display_name=display_name)
+                    user = firebase_register(email, password)
+                    firebase_update_profile(user["idToken"], display_name=display_name)
                     st.session_state.user = {
                         "uid": user["localId"],
                         "email": email,
