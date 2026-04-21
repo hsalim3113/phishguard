@@ -84,11 +84,12 @@ python src/train.py
 ```
 
 Trains four models (Logistic Regression, Random Forest, Naive Bayes, XGBoost) on the
-same train/test split, evaluates all three, and saves:
+same train/test split, evaluates all four, and saves:
 
 - `models/model_logreg.joblib` (primary deployed model)
 - `models/model_rf.joblib`
 - `models/model_nb.joblib`
+- models/model_xgb.joblib`
 - `models/tfidf_vectorizer.joblib`
 - `outputs/evaluation/` — classification report, confusion matrix, ROC curve,
   cross-validation results, and model comparison table/chart.
