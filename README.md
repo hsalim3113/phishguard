@@ -2,6 +2,8 @@
 
 ## Project Overview
 
+Live demo: https://phishguarduk.streamlit.app
+
 A machine-learning prototype that classifies emails as **phishing** or **legitimate** and
 explains the prediction in plain English.  Built as an educational tool to demonstrate
 how text classification and explainable AI techniques (LIME, SHAP) can support
@@ -81,7 +83,7 @@ Cleans the text (URL/email tokenisation, lowercasing), encodes labels, saves
 python src/train.py
 ```
 
-Trains three models (Logistic Regression, Random Forest, Naive Bayes) on the
+Trains four models (Logistic Regression, Random Forest, Naive Bayes, XGBoost) on the
 same train/test split, evaluates all three, and saves:
 
 - `models/model_logreg.joblib` (primary deployed model)
