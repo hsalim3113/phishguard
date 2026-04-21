@@ -4,19 +4,42 @@ Run from the project root:
     streamlit run src/app_streamlit.py
 """
 
+# ---------------------------------------------------------------------------
+# Standard library imports
+# ---------------------------------------------------------------------------
+
+# json: parses classification report and dataset stats JSON files written by train.py.
 import json
+
+# sys: modifies the module search path so local modules (config, explain, predict) import correctly.
 import sys
+
+# datetime: records UTC timestamps for Firestore; timezone.utc keeps them timezone-aware.
 from datetime import datetime, timezone
+
+# pathlib.Path: checks whether local model and evaluation files exist.
 from pathlib import Path
 
+# matplotlib: renders LIME/SHAP bar charts. "Agg" backend must be set before pyplot
+# import so charts render headlessly on servers without a display.
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+# pandas: builds the metrics DataFrame for the sidebar Model Performance table.
 import pandas as pd
+
+# requests: used for Firebase Authentication REST API calls and GitHub Release downloads.
 import requests
+
+# streamlit: the web framework — every st.* call renders a UI element in the browser.
 import streamlit as st
 
-# Add src/ to the path so imports work from the project root or inside src/
+# ---------------------------------------------------------------------------
+# Path setup — ensure local modules are importable
+# ---------------------------------------------------------------------------
+
+# Add src/ to sys.path so "import config" finds src/config.py regardless of launch directory.
 _SRC = Path(__file__).parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
@@ -25,25 +48,32 @@ from config import (
     CLASSIFICATION_REPORT_JSON,
     CONFUSION_MATRIX_PNG,
     DATASET_STATS_JSON,
-    EVAL_DIR,
     LIME_NUM_FEATURES,
     LOG_DIR,
     MAX_INPUT_CHARS,
     MODEL_COMPARISON_CSV,
     ROC_CURVE_PNG,
 )
-from explain import build_explainer, explain_with_lime, explain_with_shap
+
+from explain import build_explainer, explain_with_lime, explain_with_shap, explain_with_shap_xgb
 from predict import load_assets, predict_email
 
+
 # ---------------------------------------------------------------------------
-# Asset download
+# Asset download — fetches model files from GitHub Releases at first startup
 # ---------------------------------------------------------------------------
 
 def download_assets() -> None:
-    """Download model and evaluation files from GitHub releases if they don't already exist locally."""
+    """Download model and evaluation files from GitHub Releases if they are missing locally.
+
+    Checks dest.exists() before each download so files are only fetched once —
+    without this check every page interaction would re-download hundreds of MB.
+    """
     _base = "https://github.com/hsalim3113/phishguard/releases/download/v1.0"
+
     files = {
         Path("models/model_logreg.joblib"): f"{_base}/model_logreg.joblib",
+        Path("models/model_xgb.joblib"): f"{_base}/model_xgb.joblib",
         Path("models/tfidf_vectorizer.joblib"): f"{_base}/tfidf_vectorizer.joblib",
         Path("outputs/evaluation/classification_report.json"): f"{_base}/classification_report.json",
         Path("outputs/evaluation/confusion_matrix.png"): f"{_base}/confusion_matrix.png",
@@ -53,39 +83,72 @@ def download_assets() -> None:
     }
 
     for dest, url in files.items():
+        # parents=True creates intermediate dirs; exist_ok=True avoids errors on re-runs.
         dest.parent.mkdir(parents=True, exist_ok=True)
+
         if not dest.exists():
             response = requests.get(url)
+            # write_bytes preserves binary content — write_text would corrupt .joblib and .png files.
             dest.write_bytes(response.content)
 
 
+# Run once at module startup; try/except shows a non-fatal warning if download partially fails.
 try:
     download_assets()
 except Exception as e:
     st.warning(f"Some assets could not be downloaded: {e}")
 
+
 # ---------------------------------------------------------------------------
-# Firebase helpers
+# Firebase Authentication — REST API helpers
 # ---------------------------------------------------------------------------
+# Uses the Firebase Identity Toolkit REST API directly (no pyrebase4) to avoid
+# dependency conflicts. All operations POST JSON to endpoint URLs with the API key.
 
 _FIREBASE_AUTH_BASE = "https://identitytoolkit.googleapis.com/v1/accounts"
 
 
 def _api_key() -> str:
+    """Return the Firebase Web API key from Streamlit secrets.
+
+    Stored in .streamlit/secrets.toml under [firebase][apiKey] to keep it out of source control.
+    """
     return st.secrets["firebase"]["apiKey"]
 
 
 def _firebase_post(endpoint: str, payload: dict) -> dict:
+    """Send a POST request to a Firebase Identity Toolkit endpoint and return the JSON response.
+
+    Args:
+        endpoint (str): Firebase operation name, e.g. "signInWithPassword".
+        payload (dict): JSON request body with credentials or idToken.
+
+    Returns:
+        dict: Parsed JSON response from Firebase on success.
+
+    Raises:
+        Exception: With the Firebase error message string if HTTP status is not OK.
+    """
     url = f"{_FIREBASE_AUTH_BASE}:{endpoint}?key={_api_key()}"
+
+    # timeout=10 prevents the app from hanging indefinitely on network failure.
     resp = requests.post(url, json=payload, timeout=10)
     data = resp.json()
+
     if not resp.ok:
         error_msg = data.get("error", {}).get("message", "UNKNOWN_ERROR")
         raise Exception(error_msg)
+
     return data
 
 
 def firebase_sign_in(email: str, password: str) -> dict:
+    """Sign in an existing Firebase user with email and password.
+
+    Returns:
+        dict: Firebase response containing idToken, localId, and account metadata.
+    """
+    # returnSecureToken: True instructs Firebase to include the ID token in the response.
     return _firebase_post(
         "signInWithPassword",
         {"email": email, "password": password, "returnSecureToken": True},
@@ -93,6 +156,11 @@ def firebase_sign_in(email: str, password: str) -> dict:
 
 
 def firebase_register(email: str, password: str) -> dict:
+    """Create a new Firebase Auth account with email and password.
+
+    Returns:
+        dict: Same structure as firebase_sign_in — new account's idToken and localId.
+    """
     return _firebase_post(
         "signUp",
         {"email": email, "password": password, "returnSecureToken": True},
@@ -100,10 +168,31 @@ def firebase_register(email: str, password: str) -> dict:
 
 
 def firebase_get_account_info(id_token: str) -> dict:
+    """Fetch the Firebase account profile for the currently signed-in user.
+
+    The sign-in response omits displayName — this "lookup" call retrieves the full profile.
+
+    Args:
+        id_token (str): Firebase ID token from firebase_sign_in() or firebase_register().
+
+    Returns:
+        dict: Firebase response with a "users" list containing profile fields.
+    """
     return _firebase_post("lookup", {"idToken": id_token})
 
 
 def firebase_update_profile(id_token: str, display_name: str) -> dict:
+    """Set the display name on a newly created Firebase account.
+
+    signUp doesn't accept displayName — a separate "update" call is required.
+
+    Args:
+        id_token (str): ID token of the newly created account.
+        display_name (str): Name entered in the registration form.
+
+    Returns:
+        dict: Firebase response confirming the profile update.
+    """
     return _firebase_post(
         "update",
         {"idToken": id_token, "displayName": display_name, "returnSecureToken": True},
@@ -112,10 +201,16 @@ def firebase_update_profile(id_token: str, display_name: str) -> dict:
 
 @st.cache_resource
 def _firestore_client():
-    """Initialise and return a Firestore client using the service account from secrets."""
+    """Initialise and return an authenticated Firestore database client.
+
+    Returns None if GCP credentials are missing — callers check for None and skip
+    Firestore operations, so the rest of the app works without Firestore configured.
+    """
     try:
         from google.oauth2 import service_account
         from google.cloud import firestore
+
+        # dict() converts the TOML AttrDict from secrets to a plain Python dict.
         creds_dict = dict(st.secrets["gcp_service_account"])
         credentials = service_account.Credentials.from_service_account_info(creds_dict)
         return firestore.Client(credentials=credentials, project=creds_dict["project_id"])
@@ -124,7 +219,16 @@ def _firestore_client():
 
 
 def _auth_error_message(exc: Exception) -> str:
+    """Convert a raw Firebase error code into a user-friendly plain-English message.
+
+    Args:
+        exc (Exception): Exception raised by _firebase_post(); str() gives the error code.
+
+    Returns:
+        str: Plain-English message suitable for st.error().
+    """
     msg = str(exc)
+
     if "INVALID_PASSWORD" in msg or "EMAIL_NOT_FOUND" in msg or "INVALID_LOGIN_CREDENTIALS" in msg:
         return "Invalid email or password."
     if "EMAIL_EXISTS" in msg:
@@ -137,29 +241,41 @@ def _auth_error_message(exc: Exception) -> str:
 
 
 def show_auth_page() -> None:
-    """Render the login / register page. Sets st.session_state.user on success."""
+    """Render the login / register page and block access to the rest of the app.
+
+    The caller calls st.stop() immediately after this returns, so the main app
+    is completely invisible to unauthenticated users.
+    """
     st.title("🛡️ PhishGuard")
     st.write("Sign in to access the phishing detector.")
 
+    # Two tabs so the user can switch between logging in and creating a new account.
     tab_login, tab_register = st.tabs(["Login", "Register"])
 
     with tab_login:
         email = st.text_input("Email", key="login_email")
         password = st.text_input("Password", type="password", key="login_password")
+
         if st.button("Login", type="primary", key="btn_login"):
             if not email or not password:
                 st.error("Please enter your email and password.")
             else:
                 try:
                     user = firebase_sign_in(email, password)
+
+                    # The sign-in response omits displayName — fetch it separately.
                     info = firebase_get_account_info(user["idToken"])
                     display_name = info["users"][0].get("displayName") or email.split("@")[0]
+
+                    # Store user details in session_state — persists across Streamlit reruns.
                     st.session_state.user = {
                         "uid": user["localId"],
                         "email": email,
                         "display_name": display_name,
                         "id_token": user["idToken"],
                     }
+
+                    # Rerun so the auth gate passes and the main app renders immediately.
                     st.rerun()
                 except Exception as exc:
                     st.error(_auth_error_message(exc))
@@ -168,13 +284,16 @@ def show_auth_page() -> None:
         display_name = st.text_input("Display name", key="reg_name")
         email = st.text_input("Email", key="reg_email")
         password = st.text_input("Password", type="password", key="reg_password")
+
         if st.button("Create account", type="primary", key="btn_register"):
             if not display_name or not email or not password:
                 st.error("Please fill in all fields.")
             else:
                 try:
+                    # Step 1: create account — Step 2: set display name (separate call).
                     user = firebase_register(email, password)
                     firebase_update_profile(user["idToken"], display_name=display_name)
+
                     st.session_state.user = {
                         "uid": user["localId"],
                         "email": email,
@@ -187,29 +306,41 @@ def show_auth_page() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Firestore operations
+# Firestore operations — persist and retrieve user data
 # ---------------------------------------------------------------------------
 
 def save_prediction(uid: str, subject: str, label: str, confidence: float,
                     top_features: list) -> None:
-    """Save a prediction result to Firestore under the user's document."""
+    """Save a single prediction result to the user's Firestore sub-collection.
+
+    Stored at /users/{uid}/predictions/{auto-id}. Only metadata is saved (no email
+    content) — full body text is excluded for privacy. Returns silently if Firestore
+    is not configured.
+    """
     db = _firestore_client()
     if db is None:
         return
+
     try:
         db.collection("users").document(uid).collection("predictions").add({
             "timestamp": datetime.now(timezone.utc),
             "subject": subject[:200],
             "label": label,
             "confidence": round(confidence, 4),
+            # Top 3 words — enough for the history panel summary.
             "top_features": top_features[:3],
         })
     except Exception:
-        pass
+        pass  # Non-critical — prediction result is still shown to the user
 
 
 def get_history(uid: str) -> list:
-    """Return the user's last 10 predictions from Firestore, newest first."""
+    """Retrieve the user's most recent 10 predictions from Firestore.
+
+    Returns:
+        list[dict]: Up to 10 prediction dicts in descending timestamp order.
+            Returns an empty list if Firestore is unavailable.
+    """
     db = _firestore_client()
     if db is None:
         return []
@@ -226,7 +357,11 @@ def get_history(uid: str) -> list:
 
 
 def save_quiz_score(uid: str, score: int, total: int) -> None:
-    """Save the quiz score to Firestore if it beats the user's current best."""
+    """Save the quiz score to Firestore, overwriting only if the new score is a personal best.
+
+    Reads the current best before writing — merge=True preserves other fields on the
+    user document that might exist alongside the score fields.
+    """
     db = _firestore_client()
     if db is None:
         return
@@ -234,6 +369,7 @@ def save_quiz_score(uid: str, score: int, total: int) -> None:
         ref = db.collection("users").document(uid)
         doc = ref.get()
         current_best = doc.to_dict().get("quiz_best_score", 0) if doc.exists else 0
+
         if score > current_best:
             ref.set({"quiz_best_score": score, "quiz_total": total}, merge=True)
     except Exception:
@@ -241,7 +377,11 @@ def save_quiz_score(uid: str, score: int, total: int) -> None:
 
 
 def get_best_quiz_score(uid: str) -> int:
-    """Return the user's best quiz score from Firestore."""
+    """Return the user's all-time best quiz score from Firestore.
+
+    Returns:
+        int: Highest score ever recorded for this user, or 0 if unavailable.
+    """
     db = _firestore_client()
     if db is None:
         return 0
@@ -255,31 +395,57 @@ def get_best_quiz_score(uid: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# App config and startup
+# App configuration and startup
 # ---------------------------------------------------------------------------
+
+# set_page_config MUST be the first Streamlit call — any earlier st.* call raises an error.
 st.set_page_config(
     page_title="Phishing Email Detector",
     page_icon="🛡️",
     layout="wide",
 )
 
+# Create the log directory and define the log file path for local audit trail.
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOG_FILE = LOG_DIR / "predictions_log.csv"
 
 
-# cache_resource loads the model once at startup rather than on every button click
 @st.cache_resource
 def get_assets():
-    """Load model, vectoriser, and LIME explainer (cached across sessions).
+    """Load the Logistic Regression model, TF-IDF vectoriser, and LIME explainer from disk.
+
+    @st.cache_resource runs this once per server session — without caching the ~50MB
+    model would reload from disk on every button click, causing 1–2 second delays.
 
     Returns:
-        tuple: (model, vec, explainer) or raises SystemExit on missing files.
+        tuple: (model, vec, explainer) needed for prediction and LIME explanation.
+
+    Raises:
+        FileNotFoundError: If joblib files don't exist (train.py not yet run).
     """
     model, vec = load_assets()
     explainer = build_explainer()
     return model, vec, explainer
 
 
+@st.cache_resource
+def get_xgb_model():
+    """Load the XGBoost model from disk (cached across sessions).
+
+    Separated from get_assets() because XGBoost is only needed for SHAP (XGBoost)
+    and may be absent if train.py was run before XGBoost was added.
+
+    Returns:
+        XGBClassifier if models/model_xgb.joblib exists, None otherwise.
+    """
+    from joblib import load
+    xgb_path = Path("models/model_xgb.joblib")
+    if xgb_path.exists():
+        return load(xgb_path)
+    return None
+
+
+# Load the primary model at startup — show a clear error and halt if files are missing.
 try:
     model, vec, explainer = get_assets()
 except Exception:
@@ -289,23 +455,33 @@ except Exception:
     )
     st.stop()
 
+
 # ---------------------------------------------------------------------------
-# Authentication gate — show login/register page if not signed in
+# Authentication gate
 # ---------------------------------------------------------------------------
+
+# Initialise on first load — without this the "is None" check below raises KeyError.
 if "user" not in st.session_state:
     st.session_state.user = None
 
+# st.stop() is critical — it prevents ALL subsequent code from running for unauthenticated users.
 if st.session_state.user is None:
     show_auth_page()
     st.stop()
 
+# Shortcut so the rest of the file reads _user["uid"] instead of st.session_state.user["uid"].
 _user = st.session_state.user
 
+
 # ---------------------------------------------------------------------------
-# Sidebar — user info, logout, model performance, and prediction history
+# Sidebar — user info, logout, model performance, prediction history
 # ---------------------------------------------------------------------------
 with st.sidebar:
+
+    # "  \n" is the Streamlit markdown convention for a line break within a markdown string.
     st.markdown(f"**{_user['display_name']}**  \n{_user['email']}")
+
+    # Logout: sets user to None so the auth gate shows the login page on next rerun.
     if st.button("Logout", key="btn_logout"):
         st.session_state.user = None
         st.rerun()
@@ -313,7 +489,10 @@ with st.sidebar:
     st.divider()
 
     st.header("Model Performance")
+
     with st.expander("View evaluation results", expanded=False):
+
+        # .decode("utf-8-sig") strips the BOM that Windows tools sometimes add to UTF-8 files.
         report_path = CLASSIFICATION_REPORT_JSON
         if report_path.exists():
             try:
@@ -322,11 +501,11 @@ with st.sidebar:
                 report = None
         else:
             report = None
+
         if report is not None:
             rows = []
             for cls in ["Legitimate", "Phishing", "weighted avg"]:
                 key = cls.lower() if cls == "Legitimate" else cls
-                # the key casing in classification_report can vary so match it case-insensitively
                 matched = next((v for k, v in report.items()
                                 if k.lower() == cls.lower()), None)
                 if matched and isinstance(matched, dict):
@@ -337,8 +516,10 @@ with st.sidebar:
                         "F1": f"{matched.get('f1-score', 0):.3f}",
                         "Support": int(matched.get("support", 0)),
                     })
+
             if rows:
                 st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
             acc = report.get("accuracy")
             if acc:
                 st.metric("Overall accuracy", f"{acc:.3f}")
@@ -352,6 +533,7 @@ with st.sidebar:
     st.divider()
 
     st.subheader("My History")
+
     with st.expander("Last 10 predictions", expanded=False):
         history = get_history(_user["uid"])
         if history:
@@ -361,6 +543,7 @@ with st.sidebar:
                     ts_str = ts.strftime("%d %b %H:%M")
                 else:
                     ts_str = str(ts)[:16]
+
                 label_h = entry.get("label", "?")
                 conf_h = entry.get("confidence", 0)
                 subj_h = (entry.get("subject") or "")[:40]
@@ -374,8 +557,9 @@ with st.sidebar:
 
 
 # ---------------------------------------------------------------------------
-# Main page, title and info sections
+# Main page — title and information expanders
 # ---------------------------------------------------------------------------
+
 st.title("🛡️ Phishing Email Detector")
 st.write("Paste an email subject and body. The system predicts whether it is "
          "phishing or legitimate and explains the key contributing words.")
@@ -389,6 +573,7 @@ with st.expander("About this model"):
             "**Explainability:** LIME (primary), SHAP (secondary)"
         )
     with col2:
+        # utf-8-sig handles any byte-order mark Windows tools may add.
         stats_path = DATASET_STATS_JSON
         if stats_path.exists():
             try:
@@ -446,20 +631,21 @@ right — useful for training your own intuition about phishing language.
 st.divider()
 
 # ---------------------------------------------------------------------------
-# Tabs — split the app into the email analyser and the training mode
-# using st.tabs so both sections are always visible in the nav bar at the top
+# Tab navigation — Email Analyser and Training Mode
 # ---------------------------------------------------------------------------
 tab_analyser, tab_training = st.tabs(["📧 Email Analyser", "🎯 Training Mode"])
 
 
 # ===========================================================================
-# TAB 1 — Email Analyser (unchanged from original)
+# TAB 1 — Email Analyser
 # ===========================================================================
 with tab_analyser:
 
-    # -------------------------------------------------------------------------
-    # User input — subject and body with quick-load example buttons
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Example email buttons
+    # ---------------------------------------------------------------------------
+    # session_state stores pre-filled text between reruns — the correct Streamlit
+    # pattern for dynamically updating input field values.
     if "example_subject" not in st.session_state:
         st.session_state.example_subject = ""
     if "example_body" not in st.session_state:
@@ -486,24 +672,38 @@ with tab_analyser:
             )
             st.rerun()
 
+    # ---------------------------------------------------------------------------
+    # Email input fields
+    # ---------------------------------------------------------------------------
+
+    # value= reads session_state so example buttons pre-fill the fields.
     subject = st.text_input("Email subject", value=st.session_state.example_subject)
     body = st.text_area("Email body", height=220, value=st.session_state.example_body)
 
+    # Live character counter — lets the user know if their input will be truncated.
     char_count = len(subject) + len(body)
     if char_count > 0:
         st.caption(f"Characters: {char_count:,} / {MAX_INPUT_CHARS:,}")
 
+    # ---------------------------------------------------------------------------
+    # Explanation method selector
+    # ---------------------------------------------------------------------------
     explain_method = st.radio(
         "Explanation method",
-        ["LIME", "SHAP"],
+        ["LIME", "SHAP (Logistic Regression)", "SHAP (XGBoost)"],
         horizontal=True,
-        help="LIME uses random perturbation; SHAP uses model coefficients directly.",
+        help=(
+            "LIME uses random perturbation. "
+            "SHAP (LogReg) uses LinearExplainer on model coefficients. "
+            "SHAP (XGBoost) uses TreeExplainer on a gradient boosting model."
+        ),
     )
 
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
     # Learning mode
-    # -------------------------------------------------------------------------
-    # session_state keeps values between button clicks so we can track the score
+    # ---------------------------------------------------------------------------
+
+    # Score and streak persist across multiple analyses within one session.
     if "score_total" not in st.session_state:
         st.session_state.score_total = 0
     if "score_correct" not in st.session_state:
@@ -513,8 +713,10 @@ with tab_analyser:
 
     learning_mode = st.checkbox("Learning mode (guess first)")
     user_guess = None
+
     if learning_mode:
         user_guess = st.radio("Your guess", ["phishing", "legitimate"], horizontal=True)
+
         total = st.session_state.score_total
         correct = st.session_state.score_correct
         streak = st.session_state.streak
@@ -523,15 +725,18 @@ with tab_analyser:
             f"Your score: **{correct}/{total} correct ({pct}%)** | "
             f"Current streak: **{streak}**"
         )
+
         if st.button("Reset score"):
             st.session_state.score_total = 0
             st.session_state.score_correct = 0
             st.session_state.streak = 0
             st.rerun()
 
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
     # Prediction and explanation
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+
+    # All analysis code is inside this if block — nothing runs until the user clicks.
     if st.button("Analyse email", type="primary"):
 
         combined_raw = (subject or "").strip() + " " + (body or "").strip()
@@ -551,13 +756,20 @@ with tab_analyser:
                 "characters will be analysed."
             )
 
+        # combined_text is the post-truncation text — passed to the explainer so the
+        # explanation matches the prediction input exactly.
         try:
             label, confidence, combined_text = predict_email(model, vec, subject, body)
         except Exception as exc:
             st.error(f"Prediction failed. Please check your input and try again.  \n`{exc}`")
             st.stop()
 
+        # ---------------------------------------------------------------------------
+        # Display the prediction result
+        # ---------------------------------------------------------------------------
+
         st.subheader("Result")
+
         col_res, col_conf = st.columns(2)
         with col_res:
             if label == "phishing":
@@ -567,10 +779,15 @@ with tab_analyser:
         with col_conf:
             st.metric("Confidence", f"{confidence:.1%}")
 
+        # ---------------------------------------------------------------------------
+        # Learning mode feedback
+        # ---------------------------------------------------------------------------
         if learning_mode and user_guess is not None:
             st.subheader("Learning mode feedback")
+
             is_correct = user_guess == label
             st.session_state.score_total += 1
+
             if is_correct:
                 st.session_state.score_correct += 1
                 st.session_state.streak += 1
@@ -582,6 +799,10 @@ with tab_analyser:
                     f"**{label}**."
                 )
 
+        # ---------------------------------------------------------------------------
+        # Generate and display the explanation bar chart
+        # ---------------------------------------------------------------------------
+
         st.subheader(f"Explanation — top contributing words ({explain_method})")
 
         weights = []
@@ -589,8 +810,17 @@ with tab_analyser:
             if explain_method == "LIME":
                 weights = explain_with_lime(explainer, model, vec, combined_text,
                                             num_features=LIME_NUM_FEATURES)
-            else:
+
+            elif explain_method == "SHAP (Logistic Regression)":
                 weights = explain_with_shap(model, vec, combined_text)
+
+            else:  # SHAP (XGBoost)
+                xgb_model = get_xgb_model()
+                if xgb_model is None:
+                    raise ValueError(
+                        "XGBoost model not found. Run `python src/train.py` first."
+                    )
+                weights = explain_with_shap_xgb(xgb_model, vec, combined_text)
 
             if not weights:
                 raise ValueError("Explainer returned no features.")
@@ -602,24 +832,35 @@ with tab_analyser:
             )
             weights = []
 
+        # ---------------------------------------------------------------------------
+        # Render the explanation bar chart
+        # ---------------------------------------------------------------------------
         if weights:
             words = [w[0] for w in weights]
             values = [w[1] for w in weights]
-            # Red for words that push toward phishing, green for legitimate
+
+            # Red = positive weight (toward phishing); green = negative (toward legitimate).
             colours = ["#d62728" if v > 0 else "#2ca02c" for v in values]
 
+            # [::-1] reverses lists so the strongest contributor appears at the top.
             fig, ax = plt.subplots(figsize=(7, max(3, len(weights) * 0.45)))
             bars = ax.barh(words[::-1], values[::-1], color=colours[::-1])
+
             ax.axvline(0, color="black", linewidth=0.8)
             ax.set_xlabel("Weight (positive = phishing, negative = legitimate)")
             ax.set_title(f"{explain_method} Feature Weights")
+
+            # Annotate each bar with its numeric weight value just beyond the bar tip.
             for bar, val in zip(bars, values[::-1]):
                 x_pos = bar.get_width() + (0.001 if val >= 0 else -0.001)
                 ha = "left" if val >= 0 else "right"
                 ax.text(x_pos, bar.get_y() + bar.get_height() / 2,
                         f"{val:+.3f}", va="center", ha=ha, fontsize=8)
+
             fig.tight_layout()
             st.pyplot(fig)
+
+            # plt.close() releases figure memory — without it many analyses would accumulate RAM.
             plt.close(fig)
 
             st.caption(
@@ -628,7 +869,15 @@ with tab_analyser:
                 "**Longer bars** = stronger influence on the prediction"
             )
 
-            # In learning mode, show which words actually influenced the result
+            if explain_method == "SHAP (XGBoost)":
+                st.info(
+                    "**SHAP (XGBoost)** uses TreeExplainer on a gradient boosting model. "
+                    "This is less directly interpretable than Logistic Regression (where each "
+                    "weight maps to a single learned coefficient), but XGBoost typically "
+                    "achieves marginally higher accuracy by combining many shallow decision "
+                    "trees. The prediction above still uses Logistic Regression."
+                )
+
             if learning_mode:
                 top3 = [w[0] for w in sorted(weights, key=lambda x: abs(x[1]),
                                               reverse=True)[:3]]
@@ -646,14 +895,21 @@ with tab_analyser:
                         "normal correspondence than phishing attempts."
                     )
 
-        # Save prediction to Firestore
+        # ---------------------------------------------------------------------------
+        # Persist the result to Firestore and the local log
+        # ---------------------------------------------------------------------------
+
+        # Top 3 words for the history panel summary — three words fit on one sidebar line.
         top_features = [w[0] for w in sorted(weights, key=lambda x: abs(x[1]),
                                               reverse=True)[:3]] if weights else []
+
+        # save_prediction() returns silently if Firestore is not configured.
         save_prediction(_user["uid"], subject, label, confidence, top_features)
 
-        # Only log metadata, not the actual email content
+        # Local CSV log — lightweight audit trail that works without Firestore.
         ts = datetime.now().isoformat(timespec="seconds")
         log_line = f"{ts},{label},{confidence:.4f},{len(combined_text)}\n"
+
         if not LOG_FILE.exists():
             LOG_FILE.write_text("timestamp,prediction,confidence,text_length\n",
                                 encoding="utf-8")
@@ -665,18 +921,14 @@ with tab_analyser:
 
 # ===========================================================================
 # TAB 2 — Training Mode
-# Walk the user through a fixed set of examples one at a time, ask them to
-# guess, then run the real model and show LIME so they can see why it decided
-# what it did. Basically an interactive quiz using the actual classifier.
 # ===========================================================================
 with tab_training:
 
-    # -------------------------------------------------------------------------
-    # Fixed list of training examples — mix of phishing and legitimate.
-    # I kept these varied on purpose so the model has to deal with different
-    # styles of phishing (urgency, prizes, IT impersonation) and different
-    # styles of normal email (workplace, personal, transactional).
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Fixed list of training examples — 8 emails covering a range of scenarios.
+    # Half phishing (urgency, prize claims, IT impersonation, brand spoofing);
+    # half legitimate (personal, workplace, transactional, academic).
+    # ---------------------------------------------------------------------------
     TRAINING_EXAMPLES = [
         {
             "subject": "Action required: Verify your PayPal account now",
@@ -772,18 +1024,13 @@ with tab_training:
         },
     ]
 
-    # total number of examples in the exercise
     TOTAL_EXAMPLES = len(TRAINING_EXAMPLES)
 
-    # -------------------------------------------------------------------------
-    # Session state for the training mode — I'm initialising all of these here
-    # at the top so I can reference them anywhere below without key errors.
-    # tm_index tracks which example we're on (0-based).
-    # tm_submitted flips to True when the user clicks "Submit guess" so we know
-    # to show the result instead of the guess form.
-    # tm_result_* store the model output so it survives the rerun that happens
-    # when the user clicks Next.
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Training mode session state
+    # ---------------------------------------------------------------------------
+    # All quiz state lives in session_state — Streamlit reruns the entire script on
+    # every interaction, so local variables would reset without it.
     if "tm_index" not in st.session_state:
         st.session_state.tm_index = 0
     if "tm_score" not in st.session_state:
@@ -792,7 +1039,6 @@ with tab_training:
         st.session_state.tm_submitted = False
     if "tm_finished" not in st.session_state:
         st.session_state.tm_finished = False
-    # these hold the model result after submission so the chart stays visible
     if "tm_result_label" not in st.session_state:
         st.session_state.tm_result_label = None
     if "tm_result_confidence" not in st.session_state:
@@ -804,10 +1050,9 @@ with tab_training:
     if "tm_score_saved" not in st.session_state:
         st.session_state.tm_score_saved = False
 
-    # -------------------------------------------------------------------------
-    # Restart button — always visible at the top so people can reset without
-    # having to scroll to the end of a finished run
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Restart button
+    # ---------------------------------------------------------------------------
     if st.button("Restart training exercise", key="tm_restart"):
         st.session_state.tm_index = 0
         st.session_state.tm_score = 0
@@ -822,17 +1067,14 @@ with tab_training:
 
     st.divider()
 
-    # -------------------------------------------------------------------------
-    # Summary / end screen — shown once the user has gone through all examples.
-    # I calculate a percentage and pick a message based on how well they did.
-    # The tip at the bottom is static but summarises the phishing patterns that
-    # actually appeared across the examples above.
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Finished screen
+    # ---------------------------------------------------------------------------
     if st.session_state.tm_finished:
         score = st.session_state.tm_score
         pct = round(score / TOTAL_EXAMPLES * 100)
 
-        # Save score to Firestore (once per completed run)
+        # tm_score_saved prevents re-saving on every rerun while the finished screen is visible.
         if not st.session_state.tm_score_saved:
             save_quiz_score(_user["uid"], score, TOTAL_EXAMPLES)
             st.session_state.tm_score_saved = True
@@ -840,6 +1082,7 @@ with tab_training:
         best = get_best_quiz_score(_user["uid"])
 
         st.subheader("Exercise complete!")
+
         col_score, col_best = st.columns(2)
         with col_score:
             st.metric("Final score", f"{score} / {TOTAL_EXAMPLES} ({pct}%)")
@@ -857,7 +1100,6 @@ with tab_training:
 
         st.divider()
         st.subheader("Common phishing indicators in these examples")
-        # these tips are based on the actual examples in TRAINING_EXAMPLES above
         st.markdown("""
 **Urgency and deadlines** — phrases like *"expires today"*, *"within 24 hours"*, and
 *"account will be closed"* are used to stop you thinking clearly before clicking.
@@ -879,22 +1121,22 @@ order dispatch, meeting notes) are specific, personal, and don't ask you to clic
 anything urgently or hand over information.
         """)
 
-    # -------------------------------------------------------------------------
-    # Main quiz loop — only shown while the exercise is still in progress
-    # -------------------------------------------------------------------------
+    # ---------------------------------------------------------------------------
+    # Main quiz loop
+    # ---------------------------------------------------------------------------
     else:
         idx = st.session_state.tm_index
         example = TRAINING_EXAMPLES[idx]
 
-        # progress indicator so the user knows how far through they are
         st.caption(f"Example {idx + 1} of {TOTAL_EXAMPLES}  |  "
                    f"Score so far: {st.session_state.tm_score} / {idx}")
+
         st.progress((idx) / TOTAL_EXAMPLES)
 
         st.subheader(f"Example {idx + 1}")
 
-        # show the email read-only — using text_input/text_area with disabled=True
-        # so the fields look consistent with the analyser tab but can't be edited
+        # disabled=True prevents editing — key includes idx so Streamlit creates a new
+        # widget for each example rather than reusing the previous one.
         st.text_input("Subject", value=example["subject"], disabled=True,
                       key=f"tm_subj_{idx}")
         st.text_area("Body", value=example["body"], height=160, disabled=True,
@@ -902,16 +1144,14 @@ anything urgently or hand over information.
 
         st.divider()
 
-        # ---------------------------------------------------------------------
-        # Before submission — show the guess form
-        # After submission — show the result and LIME chart
-        # I'm using tm_submitted as the flag to switch between the two views.
-        # Streamlit reruns the whole script on every interaction so I need the
-        # results stored in session_state to still be there after clicking Next.
-        # ---------------------------------------------------------------------
+        # ---------------------------------------------------------------------------
+        # Two-state view: guess form (before submission) / result view (after)
+        # ---------------------------------------------------------------------------
         if not st.session_state.tm_submitted:
 
             st.markdown("**Is this email phishing or legitimate?**")
+
+            # key includes idx so the radio resets when the user moves to a new example.
             guess = st.radio(
                 "Your guess",
                 ["phishing", "legitimate"],
@@ -920,7 +1160,7 @@ anything urgently or hand over information.
             )
 
             if st.button("Submit guess", type="primary", key=f"tm_submit_{idx}"):
-                # run the real model on this example
+
                 try:
                     label, confidence, combined_text = predict_email(
                         model, vec, example["subject"], example["body"]
@@ -929,7 +1169,6 @@ anything urgently or hand over information.
                     st.error(f"Model prediction failed: {exc}")
                     st.stop()
 
-                # run LIME on the combined text
                 weights = []
                 try:
                     weights = explain_with_lime(
@@ -937,19 +1176,16 @@ anything urgently or hand over information.
                         num_features=LIME_NUM_FEATURES,
                     )
                 except Exception:
-                    # LIME sometimes fails on very short inputs, that's fine
-                    pass
+                    pass  # LIME failure is non-fatal — explanation just won't show
 
-                # store everything in session_state so it survives the rerun
+                # Store results in session_state — local variables are lost after st.rerun().
                 st.session_state.tm_user_guess = guess
                 st.session_state.tm_result_label = label
                 st.session_state.tm_result_confidence = confidence
                 st.session_state.tm_result_weights = weights
 
-                # update score — comparing against the ground truth label in
-                # the example dict, not the model prediction, because this is
-                # a quiz about whether the user can spot phishing, not whether
-                # they agree with the model
+                # Score against ground truth (not the model) — user can be right when
+                # the model is wrong.
                 if guess == example["label"]:
                     st.session_state.tm_score += 1
 
@@ -957,29 +1193,26 @@ anything urgently or hand over information.
                 st.rerun()
 
         else:
-            # -----------------------------------------------------------------
-            # Result view — shown after the user has submitted their guess
-            # -----------------------------------------------------------------
+            # --- RESULT VIEW ---
+
             guess = st.session_state.tm_user_guess
             label = st.session_state.tm_result_label
             confidence = st.session_state.tm_result_confidence
             weights = st.session_state.tm_result_weights
             ground_truth = example["label"]
 
-            # was the user correct against the ground truth?
             user_correct = (guess == ground_truth)
 
             st.subheader("Result")
 
+            # Three columns: actual label, model prediction, model confidence.
             col_truth, col_model, col_conf = st.columns(3)
             with col_truth:
-                # show what the email actually was
                 if ground_truth == "phishing":
                     st.error(f"Actual: **PHISHING** 🚨")
                 else:
                     st.success(f"Actual: **LEGITIMATE** ✅")
             with col_model:
-                # show what the model predicted — could differ from ground truth
                 if label == "phishing":
                     st.error(f"Model: **PHISHING** 🚨")
                 else:
@@ -987,7 +1220,6 @@ anything urgently or hand over information.
             with col_conf:
                 st.metric("Model confidence", f"{confidence:.1%}")
 
-            # feedback on whether the user got it right
             if user_correct:
                 st.success(f"You guessed **{guess}** — correct!")
             else:
@@ -995,15 +1227,16 @@ anything urgently or hand over information.
                     f"You guessed **{guess}** but this was a **{ground_truth}** email."
                 )
 
-            # if the model disagreed with the ground truth, flag it so the
-            # user doesn't get confused — this does occasionally happen
+            # Flag when the model disagrees with the ground truth so the user isn't confused.
             if label != ground_truth:
                 st.info(
                     f"Note: the model predicted **{label}** but the correct answer "
                     f"is **{ground_truth}**. The model isn't always right."
                 )
 
-            # LIME bar chart — same rendering logic as the analyser tab
+            # ---------------------------------------------------------------------------
+            # LIME explanation bar chart for the training mode result view
+            # ---------------------------------------------------------------------------
             if weights:
                 st.subheader("LIME explanation — why did the model decide this?")
 
@@ -1016,6 +1249,7 @@ anything urgently or hand over information.
                 ax.axvline(0, color="black", linewidth=0.8)
                 ax.set_xlabel("Weight (positive = phishing, negative = legitimate)")
                 ax.set_title("LIME Feature Weights")
+
                 for bar, val in zip(bars, values[::-1]):
                     x_pos = bar.get_width() + (0.001 if val >= 0 else -0.001)
                     ha = "left" if val >= 0 else "right"
@@ -1035,10 +1269,9 @@ anything urgently or hand over information.
 
             st.divider()
 
-            # -----------------------------------------------------------------
-            # Next button — advances to next example or triggers the end screen
-            # tm_submitted gets reset to False so the guess form shows again
-            # -----------------------------------------------------------------
+            # ---------------------------------------------------------------------------
+            # Next button — advances to the next example or shows the results screen
+            # ---------------------------------------------------------------------------
             if idx + 1 >= TOTAL_EXAMPLES:
                 next_label = "See results"
             else:
